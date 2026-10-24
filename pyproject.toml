@@ -1,0 +1,106 @@
+[project]
+name = "ai-code-reviewer"
+version = "0.1.0"
+description = "Multi-agent LangGraph AI code reviewer for GitHub pull requests"
+readme = "README.md"
+requires-python = ">=3.12"
+
+# Pinned for reproducible installs. Regenerate the lock file after any change:
+#   uv lock          (preferred)
+#   uv sync --dev
+dependencies = [
+    "fastapi==0.141.1",
+    "uvicorn==0.52.0",
+    "httpx==0.28.1",
+    "langgraph==1.2.10",
+    "langchain-core==1.5.2",
+    "langchain-groq==1.1.3",
+    "pydantic==2.13.4",
+    "pydantic-settings==2.13.1",
+    "structlog==25.5.0",
+    "tenacity==9.1.4",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==9.1.1",
+    "pytest-cov==7.0.0",
+    "ruff==0.15.1",
+    "mypy==1.19.0",
+    "pre-commit==4.4.0",
+    "respx==0.22.0",
+]
+
+[project.scripts]
+review = "app.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
+# --------------------------------------------------------------------------
+# ruff
+# --------------------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["app", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "B",    # flake8-bugbear
+    "C4",   # comprehensions
+    "UP",   # pyupgrade
+    "SIM",  # flake8-simplify
+    "RET",  # flake8-return
+    "ARG",  # unused arguments
+    "PTH",  # prefer pathlib
+    "TRY",  # tryceratops
+    "LOG",  # flake8-logging
+    "G",    # flake8-logging-format
+    "S",    # bandit
+    "ASYNC",
+]
+ignore = [
+    "TRY003",  # long messages outside exception class - fine for this codebase
+    "E501",    # line length is enforced by the formatter
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101", "ARG"]  # asserts and unused fixture args are expected in tests
+
+# --------------------------------------------------------------------------
+# mypy
+# --------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unreachable = true
+pretty = true
+files = ["app", "tests", "eval"]
+
+# The LangGraph node layer still passes state around as a plain dict; it is
+# rewritten in Phase 2 (typed state + reducers), at which point these
+# relaxations should be deleted rather than extended.
+[[tool.mypy.overrides]]
+module = ["app.graph.*"]
+disallow_any_explicit = false
+
+[[tool.mypy.overrides]]
+module = ["langchain_groq.*", "langgraph.*"]
+ignore_missing_imports = true
+
+# --------------------------------------------------------------------------
+# pytest
+# --------------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers --strict-config"
+filterwarnings = ["error"]
