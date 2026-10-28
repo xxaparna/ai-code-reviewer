@@ -33,7 +33,10 @@ function verdict(review: ReviewDetail, counts: Record<Severity, number>) {
     return {
       tone: "high",
       label: "Review incomplete",
-      detail: "Some agents failed, so a clean result here does not mean clean code. Re-run the review.",
+      detail:
+        review.metadata.partial_reason && !(review.metadata.errors ?? []).length
+          ? `${review.metadata.partial_reason} A clean result here does not mean clean code.`
+          : "Some agents failed, so a clean result here does not mean clean code. Re-run the review.",
     }
   if (counts.HIGH)
     return {
@@ -92,7 +95,10 @@ export function ReviewOverview({ review }: { review: ReviewDetail }) {
       {errors.length > 0 && (
         <Alert variant="destructive">
           <TriangleAlert />
-          <AlertTitle>Partial review: {errors.length} agent{errors.length === 1 ? "" : "s"} failed</AlertTitle>
+          <AlertTitle>
+            Partial review: {failed.size} agent{failed.size === 1 ? "" : "s"} failed
+            {errors.length > failed.size ? ` (${errors.length} file reviews)` : ""}
+          </AlertTitle>
           <AlertDescription>
             {[...failed].join(", ")} did not finish. Findings below are incomplete, and merging is blocked until a
             complete re-run.

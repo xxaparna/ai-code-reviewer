@@ -13,7 +13,7 @@ class CodeReviewerError(Exception):
         self.message = message
 
 
-class InvalidPRURLError(CodeReviewerError):
+class InvalidPRURLError(CodeReviewerError, ValueError):
     """Raised when a pull request URL is malformed or invalid."""
 
 
@@ -23,6 +23,17 @@ class PRNotFoundError(CodeReviewerError):
 
 class RepoAccessDeniedError(CodeReviewerError):
     """Raised when GitHub access is unauthorized or forbidden."""
+
+
+class GitHubAuthError(RepoAccessDeniedError):
+    """Raised when GitHub rejects the server's own credentials (401).
+
+    That is a server misconfiguration, not the caller's fault, so it maps to 502.
+    """
+
+
+class UpstreamError(CodeReviewerError):
+    """Raised when an upstream service keeps failing (5xx, network) after retries."""
 
 
 class UpstreamRateLimitError(CodeReviewerError):
@@ -39,6 +50,18 @@ class LLMUnavailableError(CodeReviewerError):
 
 class DiffTooLargeError(CodeReviewerError):
     """Raised when a PR diff exceeds processing limits."""
+
+
+class StructuredOutputError(CodeReviewerError):
+    """Raised when the model answered, but not in the requested structured shape.
+
+    Not transient: retrying the same call is pointless, so the caller falls back
+    to the tolerant text parser instead (when enabled).
+    """
+
+
+class UnknownAgentError(CodeReviewerError, ValueError):
+    """Raised when a review asks for an agent that is not registered or is disabled."""
 
 
 class BudgetExceededError(CodeReviewerError):

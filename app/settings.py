@@ -42,6 +42,54 @@ class Settings(BaseSettings):
         description="Sampling temperature. Low values keep reviews deterministic.",
     )
 
+    groq_model_fast: str | None = Field(
+        default=None,
+        description=(
+            "Model for agents with model_tier 'fast' in agents.yaml (e.g. style). "
+            "Unset means every agent uses GROQ_MODEL. Check JSON-mode support first."
+        ),
+    )
+
+    # --- LLM resilience ----------------------------------------------------
+    llm_timeout_seconds: float = Field(default=45.0, gt=0, description="Per-call LLM timeout.")
+    llm_max_attempts: int = Field(
+        default=3, ge=1, le=6, description="Attempts per LLM call on 429/5xx/timeouts."
+    )
+    llm_structured_output: bool = Field(
+        default=True, description="Ask the model for schema-constrained output first."
+    )
+    llm_tolerant_fallback: bool = Field(
+        default=True,
+        description=(
+            "When structured output fails, retry once as plain text and parse it "
+            "tolerantly (fences, prose-wrapped JSON). Disable to fail fast instead."
+        ),
+    )
+    max_concurrent_llm_calls: int = Field(
+        default=5, ge=1, le=64, description="Upper bound on parallel reviewer calls."
+    )
+
+    # --- review shaping (Phase 2) -----------------------------------------
+    max_patch_chars: int = Field(
+        default=40_000, ge=1_000, description="Files whose diff is larger are skipped."
+    )
+    max_review_prompt_tokens: int = Field(
+        default=400_000,
+        ge=1_000,
+        description=(
+            "Estimated prompt-token budget for one review (all files x all agents). "
+            "Beyond it, lower-risk files are skipped and the review is marked partial."
+        ),
+    )
+    max_findings_per_file: int = Field(default=10, ge=1, description="Cap after dedup, per file.")
+    max_findings_per_review: int = Field(default=50, ge=1, description="Cap after dedup, total.")
+    dedup_similarity_threshold: int = Field(
+        default=70, ge=0, le=100, description="rapidfuzz score (0-100) for two messages to match."
+    )
+    dedup_line_window: int = Field(
+        default=3, ge=0, description="Findings this many lines apart may be duplicates."
+    )
+
     # --- publishing and merging -------------------------------------------
     suggestion_min_severity: Literal["LOW", "MEDIUM", "HIGH"] = Field(
         default="MEDIUM",

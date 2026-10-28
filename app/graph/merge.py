@@ -1,79 +1,112 @@
-from difflib import SequenceMatcher
+"""Fan-in: cross-agent fuzzy dedup, then caps (plan 1.11 / 2.7 / 2.8).
+
+The §4b baseline measured a 2.2x duplication factor: one SQL injection was
+reported four times by four agents, in four wordings and categories. Two
+findings are the same issue when they are in the same file, within
+``line_window`` lines of each other, and their messages are similar
+(``rapidfuzz.fuzz.token_set_ratio`` >= ``threshold``). Category is ignored on
+purpose - mislabelled categories are exactly what defeated the old exact key.
+The highest-severity copy survives and counts how many it absorbed.
+"""
+
+from collections import defaultdict
 from typing import Any
 
-from app.graph.state import ReviewState
-from app.models.enums import Severity
+from rapidfuzz import fuzz
+from rapidfuzz.utils import default_process
+
+from app.graph.state import ReviewState, StateNode
 from app.models.review_comment import ReviewComment
-
-SEVERITY_ORDER = {
-    Severity.HIGH: 0,
-    Severity.MEDIUM: 1,
-    Severity.LOW: 2,
-}
+from app.review_config import ReviewConfig
 
 
-def is_similar_message(msg1: str, msg2: str, threshold: float = 0.65) -> bool:
-    """Return True if two finding messages are fuzzy-matched as similar."""
-    if not msg1 or not msg2:
-        return False
-    clean1 = msg1.strip().lower()
-    clean2 = msg2.strip().lower()
-    if clean1 == clean2:
-        return True
-    return SequenceMatcher(None, clean1, clean2).ratio() >= threshold
+def message_similarity(a: str, b: str) -> float:
+    """0-100. Order-insensitive, tolerant of one message elaborating on the other."""
+    if not a or not b:
+        return 0.0
+    return float(fuzz.token_set_ratio(a, b, processor=default_process))
 
 
-def merge_node(state: ReviewState) -> dict[str, Any]:
-    """
-    Merges, deduplicates, and sorts findings from all specialized reviewer nodes.
-    Applies fuzzy line-window matching (line +/- 3) and string similarity.
-    """
-    raw_comments: list[ReviewComment] = []
+def _lines_close(a: int | None, b: int | None, window: int) -> bool:
+    if a is None or b is None:
+        return a is None and b is None
+    return abs(a - b) <= window
 
-    raw_comments.extend(state.get("bug_comments", []))
-    raw_comments.extend(state.get("security_comments", []))
-    raw_comments.extend(state.get("style_comments", []))
-    raw_comments.extend(state.get("performance_comments", []))
-    raw_comments.extend(state.get("architecture_comments", []))
 
-    # Sort high severity first, then by file, line, and message length
-    raw_comments.sort(
-        key=lambda c: (
-            SEVERITY_ORDER.get(c.severity, 99),
-            c.file,
-            c.line if c.line is not None else -1,
-            -len(c.message),
+def _sort_key(c: ReviewComment) -> tuple[int, str, int, int]:
+    return (c.severity.rank, c.file, c.line if c.line is not None else -1, -len(c.message))
+
+
+def dedup_findings(
+    findings: list[ReviewComment], *, threshold: float, line_window: int
+) -> tuple[list[ReviewComment], int]:
+    """Collapse duplicates. Returns (unique findings, number collapsed)."""
+    by_file: dict[str, list[ReviewComment]] = defaultdict(list)
+    collapsed = 0
+    for comment in sorted(findings, key=_sort_key):
+        kept = by_file[comment.file]
+        match = next(
+            (
+                existing
+                for existing in kept
+                if _lines_close(existing.line, comment.line, line_window)
+                and message_similarity(existing.message, comment.message) >= threshold
+            ),
+            None,
         )
-    )
+        if match is None:
+            kept.append(comment.model_copy(deep=True))
+            continue
+        collapsed += 1
+        match.dedup_collapsed_count += comment.dedup_collapsed_count
+        # Keep the higher-severity wording, but not at the cost of a concrete fix
+        # that only a lower-ranked duplicate proposed.
+        if match.suggested_code is None and comment.suggested_code is not None:
+            match.suggested_code = comment.suggested_code
+            match.start_line = comment.start_line
+            match.line = comment.line
+    unique = [c for group in by_file.values() for c in group]
+    return sorted(unique, key=_sort_key), collapsed
 
-    unique_comments: list[ReviewComment] = []
 
-    for comment in raw_comments:
-        matched = False
-        for existing in unique_comments:
-            if existing.file != comment.file:
-                continue
+def apply_caps(
+    findings: list[ReviewComment], *, per_file: int, per_review: int
+) -> tuple[list[ReviewComment], int, int]:
+    """Keep the most severe findings. Input must be severity-sorted."""
+    seen: dict[str, int] = defaultdict(int)
+    within_file: list[ReviewComment] = []
+    for comment in findings:
+        if seen[comment.file] < per_file:
+            within_file.append(comment)
+        seen[comment.file] += 1
+    capped = within_file[:per_review]
+    return capped, len(findings) - len(within_file), len(within_file) - len(capped)
 
-            # Line distance check (both None or line delta <= 3)
-            line_match = False
-            if existing.line is None and comment.line is None:
-                line_match = True
-            elif existing.line is not None and comment.line is not None:
-                if abs(existing.line - comment.line) <= 3:
-                    line_match = True
 
-            if line_match and is_similar_message(existing.message, comment.message):
-                existing.dedup_collapsed_count += comment.dedup_collapsed_count
-                # Keep the higher-severity wording, but don't lose a concrete fix
-                # that only a lower-ranked duplicate proposed.
-                if existing.suggested_code is None and comment.suggested_code is not None:
-                    existing.suggested_code = comment.suggested_code
-                    existing.start_line = comment.start_line
-                    existing.line = comment.line
-                matched = True
-                break
+def make_merge_node(config: ReviewConfig) -> StateNode:
+    def merge_node(state: ReviewState) -> dict[str, Any]:
+        raw = list(state.get("findings", []))
+        unique, collapsed = dedup_findings(
+            raw,
+            threshold=config.dedup_similarity_threshold,
+            line_window=config.dedup_line_window,
+        )
+        capped, over_file, over_review = apply_caps(
+            unique,
+            per_file=config.max_findings_per_file,
+            per_review=config.max_findings_per_review,
+        )
+        return {
+            "merged_comments": capped,
+            "merge_stats": {
+                "raw_findings": len(raw),
+                "duplicates_collapsed": collapsed,
+                "capped_per_file": over_file,
+                "capped_per_review": over_review,
+            },
+        }
 
-        if not matched:
-            unique_comments.append(comment.model_copy(deep=True))
+    return merge_node
 
-    return {"merged_comments": unique_comments}
+
+merge_node = make_merge_node(ReviewConfig())

@@ -6,7 +6,15 @@ from typing import Any
 
 import httpx
 import pytest
+from app.agents.registry import default_registry
 from app.api.routes import get_review_service, get_review_store
+from app.errors import (
+    GitHubAuthError,
+    LLMUnavailableError,
+    PRNotFoundError,
+    UpstreamError,
+    UpstreamRateLimitError,
+)
 from app.main import create_app
 from app.models.enums import Category, Severity
 from app.models.review_comment import ReviewComment
@@ -28,14 +36,22 @@ class StubReviewService:
 
     def __init__(self) -> None:
         self.github_service = FakeGitHubService()
+        self.registry = default_registry()
+        self.fail_with: Exception | None = None
+        self.requested_agents: list[str] | None = None
 
     def fetch_request(self, pr_url: str) -> ReviewRequest:
+        if self.fail_with is not None:
+            raise self.fail_with
         return make_review_request(
             head_sha="deadbeef",
             files=[ReviewFile(filename="app/example.py", status="modified", patch=PATCH)],
         )
 
-    def review(self, request: ReviewRequest) -> ReviewResponse:
+    def review(self, request: ReviewRequest, agents: list[str] | None = None) -> ReviewResponse:
+        if agents is not None:
+            self.registry.select(agents)
+        self.requested_agents = agents
         return ReviewResponse(
             summary="One issue.",
             comments=[
@@ -60,6 +76,7 @@ def app(monkeypatch: pytest.MonkeyPatch) -> Iterator[FastAPI]:
     get_settings.cache_clear()
     application = create_app()
     stub = StubReviewService()
+    application.state.stub = stub
     store = ReviewStore()
     application.dependency_overrides[get_review_service] = lambda: stub
     application.dependency_overrides[get_review_store] = lambda: store
@@ -121,3 +138,49 @@ def test_review_lifecycle(app: FastAPI) -> None:
 def test_unknown_review_is_404(app: FastAPI) -> None:
     [response] = _call(app, [("GET", "/api/v1/reviews/nope", None)])
     assert response.status_code == 404
+
+
+def test_agents_endpoint_and_subset(app: FastAPI) -> None:
+    [agents] = _call(app, [("GET", "/api/v1/agents", None)])
+    subset, unknown = _call(
+        app,
+        [
+            (
+                "POST",
+                "/api/v1/reviews",
+                {"pr_url": "https://github.com/o/r/pull/7", "agents": ["bug"]},
+            ),
+            (
+                "POST",
+                "/api/v1/reviews",
+                {"pr_url": "https://github.com/o/r/pull/7", "agents": ["x"]},
+            ),
+        ],
+    )
+    assert [a["name"] for a in agents.json()][:2] == ["bug", "security"]
+    assert subset.status_code == 201
+    assert app.state.stub.requested_agents == ["bug"]
+    assert unknown.status_code == 400
+
+
+@pytest.mark.parametrize(
+    ("exc", "status", "retry_after"),
+    [
+        (PRNotFoundError("missing"), 404, None),
+        (GitHubAuthError("bad token"), 502, None),
+        (UpstreamRateLimitError("slow down", retry_after=17), 429, "17"),
+        (UpstreamError("GitHub 503 body: internal secrets"), 502, None),
+        (LLMUnavailableError("groq said: internal secrets"), 502, None),
+        (RuntimeError("boom with internal secrets"), 500, None),
+    ],
+)
+def test_errors_map_to_status_codes_without_leaking(
+    app: FastAPI, exc: Exception, status: int, retry_after: str | None
+) -> None:
+    app.state.stub.fail_with = exc
+    [response] = _call(
+        app, [("POST", "/api/v1/reviews", {"pr_url": "https://github.com/o/r/pull/7"})]
+    )
+    assert response.status_code == status
+    assert "internal secrets" not in response.text
+    assert response.headers.get("Retry-After") == retry_after

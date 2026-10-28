@@ -1,9 +1,14 @@
 """Test doubles: exercise the full pipeline with no network and no LLM spend."""
 
-from typing import Any
+import json
+import threading
+from typing import Any, TypeVar
 
-from app.errors import GitHubRejectedError
+from app.errors import GitHubRejectedError, StructuredOutputError
 from app.models.review_file import ReviewFile
+from pydantic import BaseModel
+
+T = TypeVar("T", bound=BaseModel)
 
 
 class FakeLLMClient:
@@ -13,9 +18,18 @@ class FakeLLMClient:
     records every call so tests can assert on fan-out.
     """
 
-    def __init__(self, *, fail_agents: set[str] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        fail_agents: set[str] | None = None,
+        responses: dict[str, str] | None = None,
+        fail_with: Exception | None = None,
+    ) -> None:
         self.calls: list[dict[str, str]] = []
         self.fail_agents = fail_agents or set()
+        self.fail_with = fail_with
+        self._responses = {**self._RESPONSES, **(responses or {})}
+        self._lock = threading.Lock()
 
     # Keyed by a distinctive phrase in each agent's system prompt.
     _RESPONSES: dict[str, str] = {
@@ -45,19 +59,35 @@ class FakeLLMClient:
     }
 
     def _agent_for(self, system_prompt: str) -> str:
-        for marker in self._RESPONSES:
+        for marker in self._responses:
             if marker in system_prompt:
                 return marker
         return "unknown"
 
-    def generate(self, *, system_prompt: str, user_prompt: str) -> str:
+    def _respond(self, system_prompt: str, user_prompt: str, mode: str) -> str:
         agent = self._agent_for(system_prompt)
-        self.calls.append({"agent": agent, "user_prompt": user_prompt})
-
+        with self._lock:
+            self.calls.append({"agent": agent, "user_prompt": user_prompt, "mode": mode})
         if agent in self.fail_agents:
-            raise RuntimeError(f"simulated upstream failure for {agent}")
+            raise self.fail_with or RuntimeError(f"simulated upstream failure for {agent}")
+        return self._responses.get(agent, '{"comments": []}')
 
-        return self._RESPONSES.get(agent, '{"comments": []}')
+    def generate(self, *, system_prompt: str, user_prompt: str) -> str:
+        return self._respond(system_prompt, user_prompt, "text")
+
+    def generate_structured(self, *, system_prompt: str, user_prompt: str, schema: type[T]) -> T:
+        """Like JSON mode: only a bare JSON object is accepted, anything else fails."""
+        text = self._respond(system_prompt, user_prompt, "structured")
+        try:
+            return schema.model_validate(json.loads(text))
+        except ValueError as exc:
+            raise StructuredOutputError("not valid structured output") from exc
+
+
+# One hunk: new-file lines 1-40 are all added, so findings on 5, 12 and 30 are grounded.
+DEFAULT_PATCH = "@@ -1,1 +1,40 @@\n-import sys\n" + "\n".join(
+    f"+line_{i} = {i}" for i in range(1, 41)
+)
 
 
 class FakeGitHubService:
@@ -85,10 +115,10 @@ class FakeGitHubService:
                 {
                     "filename": "app/example.py",
                     "status": "modified",
-                    "patch": "@@ -1,4 +1,6 @@\n+import os\n+print(token)\n-import sys\n",
-                    "additions": 2,
+                    "patch": DEFAULT_PATCH,
+                    "additions": 40,
                     "deletions": 1,
-                    "changes": 3,
+                    "changes": 41,
                 }
             ]
         )

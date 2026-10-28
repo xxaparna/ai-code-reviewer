@@ -1,119 +1,175 @@
-"""End-to-end pipeline tests: real LangGraph, fake LLM, no network.
+"""End-to-end pipeline tests: real LangGraph, fake LLM, no network."""
 
-This is the first test that actually executes the compiled graph. It is the
-safety net Phase 1 and Phase 2 refactors need.
-"""
+from typing import Any
 
-import app.graph.nodes as nodes_module
-import app.graph.summary as summary_module
-import pytest
+from app.agents.registry import default_registry
+from app.errors import UpstreamRateLimitError
+from app.review_config import ReviewConfig
 from app.services.review_service import ReviewService
 
 from tests.fakes import FakeGitHubService, FakeLLMClient
 
 PR_URL = "https://github.com/test-owner/test-repo/pull/7"
-REVIEWER_AGENT_COUNT = 5
+REVIEWER_AGENT_COUNT = len(default_registry().enabled)
+SUMMARY = "Principal Software Engineer"
 
 
-@pytest.fixture
-def fake_llm(monkeypatch: pytest.MonkeyPatch) -> FakeLLMClient:
-    """Inject a fake LLM into the module-level reviewer and summary nodes.
-
-    The nodes hold a shared BaseNode singleton; Phase 2 replaces that with an
-    injected agent registry, at which point this fixture gets simpler.
-    """
-    client = FakeLLMClient()
-    monkeypatch.setattr(nodes_module._node, "_llm", client)
-    monkeypatch.setattr(summary_module._node, "_llm", client)
-    return client
+def _service(llm: FakeLLMClient, **github: Any) -> tuple[ReviewService, FakeGitHubService]:
+    gh = FakeGitHubService(**github)
+    return ReviewService(gh, llm=llm), gh  # type: ignore[arg-type]
 
 
-@pytest.fixture
-def failing_llm(monkeypatch: pytest.MonkeyPatch) -> FakeLLMClient:
-    client = FakeLLMClient(fail_agents={"Security Engineer"})
-    monkeypatch.setattr(nodes_module._node, "_llm", client)
-    monkeypatch.setattr(summary_module._node, "_llm", client)
-    return client
+def _file(name: str, patch: str = "@@ -1 +1,2 @@\n+x = 1\n+y = 2\n") -> dict[str, Any]:
+    return {"filename": name, "status": "modified", "patch": patch}
 
 
-def test_full_review_produces_merged_sorted_findings(fake_llm: FakeLLMClient) -> None:
-    github = FakeGitHubService()
-    service = ReviewService(github_service=github)  # type: ignore[arg-type]
+def test_full_review_produces_merged_sorted_findings() -> None:
+    llm = FakeLLMClient()
+    review = _service(llm)[0].review_pr_url(PR_URL)
 
-    review = service.review_pr_url(PR_URL)
-
-    # Every reviewer agent ran, plus the summary node.
-    assert len(fake_llm.calls) == REVIEWER_AGENT_COUNT + 1
-
-    assert len(review.comments) == 5
-
-    # Sorted by severity, then file, then line (line-less findings first).
-    assert [c.severity for c in review.comments] == ["HIGH", "HIGH", "MEDIUM", "MEDIUM", "LOW"]
-    assert [c.category for c in review.comments] == [
-        "BUG",
-        "SECURITY",
-        "ARCHITECTURE",
-        "SECURITY",
-        "STYLE",
+    # Severity first; within MEDIUM the file-level finding (no line) sorts first.
+    assert [(c.severity, c.category, c.line) for c in review.comments] == [
+        ("HIGH", "BUG", 12),
+        ("MEDIUM", "ARCHITECTURE", None),
+        ("MEDIUM", "SECURITY", 30),
     ]
-
     assert review.summary == "One high-severity bug and two minor issues."
-    assert review.metadata["complete"] is True
-    assert review.metadata["total_files"] == 1
-    assert review.metadata["total_comments"] == 5
-    assert review.metadata["severity_counts"] == {"HIGH": 2, "MEDIUM": 2, "LOW": 1}
-    assert review.metadata["errors"] == []
+    meta = review.metadata
+    assert meta["complete"] is True
+    assert meta["partial"] is False
+    assert meta["total_files"] == meta["reviewed_files"] == 1
+    assert meta["severity_counts"] == {"HIGH": 1, "MEDIUM": 2}
+    assert meta["errors"] == []
 
 
-def test_cross_agent_duplicates_survive_dedup(fake_llm: FakeLLMClient) -> None:
-    """Documents the Phase 2.7 gap: dedup is keyed on category as well.
+def test_cross_agent_duplicates_are_collapsed() -> None:
+    """Bug and security both report line 12: one finding survives, counting both."""
+    review = _service(FakeLLMClient())[0].review_pr_url(PR_URL)
 
-    The bug agent and the security agent both report "Unchecked None
-    dereference." on app/example.py:12. Because merge.py keys on
-    (file, line, category, message), the identical finding is reported twice.
-    Two agents describing the same issue in *different words* would also both
-    survive. When fuzzy dedup lands, this becomes one finding and this test
-    should be rewritten to assert the collapse.
-    """
-    service = ReviewService(github_service=FakeGitHubService())  # type: ignore[arg-type]
-
-    review = service.review_pr_url(PR_URL)
     line_12 = [c for c in review.comments if c.line == 12]
+    assert len(line_12) == 1
+    assert line_12[0].dedup_collapsed_count == 2
+    assert review.metadata["duplicates_collapsed"] == 1
+    assert review.metadata["raw_findings"] == 4
 
-    assert len(line_12) == 2
-    assert {c.message for c in line_12} == {"Unchecked None dereference."}
-    assert {c.category for c in line_12} == {"BUG", "SECURITY"}
+
+def test_differently_worded_duplicates_within_the_line_window_collapse() -> None:
+    llm = FakeLLMClient(
+        responses={
+            "Senior Software Engineer": '{"comments": [{"line": 10, "severity": "HIGH", '
+            '"category": "BUG", "message": "SQL query built by string concatenation"}]}',
+            "Security Engineer": '{"comments": [{"line": 12, "severity": "HIGH", '
+            '"category": "SECURITY", "message": "SQL query is built by string '
+            'concatenation, allowing SQL injection"}]}',
+            "Senior Code Reviewer": '{"comments": []}',
+            "Software Architect": '{"comments": []}',
+        }
+    )
+    review = _service(llm)[0].review_pr_url(PR_URL)
+    assert len(review.comments) == 1
+    assert review.comments[0].dedup_collapsed_count == 2
 
 
-def test_fenced_and_prose_wrapped_json_are_both_parsed(fake_llm: FakeLLMClient) -> None:
+def test_style_agent_severity_floor_drops_low_findings() -> None:
+    review = _service(FakeLLMClient())[0].review_pr_url(PR_URL)
+
+    assert not any(c.category == "STYLE" for c in review.comments)
+    assert review.metadata["below_severity_floor_dropped"] == 1
+    assert review.metadata["agent_stats"]["style"]["dropped"] == 1
+
+
+def test_structured_output_first_tolerant_fallback_second() -> None:
     """The style agent replies in a ```json fence, the architect in prose."""
-    service = ReviewService(github_service=FakeGitHubService())  # type: ignore[arg-type]
+    llm = FakeLLMClient()
+    review = _service(llm)[0].review_pr_url(PR_URL)
 
-    review = service.review_pr_url(PR_URL)
-    categories = {c.category for c in review.comments}
+    fallbacks = [c["agent"] for c in llm.calls if c["mode"] == "text" and c["agent"] != SUMMARY]
+    assert sorted(fallbacks) == ["Senior Code Reviewer", "Software Architect"]
+    assert review.metadata["structured_output_fallbacks"] == 2
+    assert "ARCHITECTURE" in {c.category for c in review.comments}  # recovered from prose
 
-    assert "STYLE" in categories  # came from a fenced block
-    assert "ARCHITECTURE" in categories  # came from a bare array inside prose
 
-
-def test_one_failing_agent_degrades_instead_of_crashing(failing_llm: FakeLLMClient) -> None:
-    """A partial review must be reported as partial, never as clean."""
-    service = ReviewService(github_service=FakeGitHubService())  # type: ignore[arg-type]
-
+def test_fallback_can_be_disabled() -> None:
+    llm = FakeLLMClient()
+    service = ReviewService(
+        FakeGitHubService(),  # type: ignore[arg-type]
+        llm=llm,
+        config=ReviewConfig(tolerant_fallback=False),
+    )
     review = service.review_pr_url(PR_URL)
 
     assert review.metadata["complete"] is False
+    assert {e.split(":")[0] for e in review.metadata["errors"]} == {"style", "architecture"}
+
+
+def test_one_failing_agent_degrades_instead_of_crashing() -> None:
+    """A partial review must be reported as partial, never as clean."""
+    llm = FakeLLMClient(fail_agents={"Security Engineer"})
+    review = _service(llm)[0].review_pr_url(PR_URL)
+
+    assert review.metadata["complete"] is False
+    assert review.metadata["partial"] is True
     assert len(review.metadata["errors"]) == 1
-    assert "security_comments" in review.metadata["errors"][0]
-
-    # The surviving agents still reported.
+    assert review.metadata["errors"][0].startswith("security: app/example.py:")
+    assert review.metadata["agent_stats"]["security"]["failed"] == 1
     assert len(review.comments) > 0
-    assert not any(c.category == "SECURITY" for c in review.comments)
+    assert not any(c.agent == "security" for c in review.comments)
 
 
-def test_publishing_is_opt_in(fake_llm: FakeLLMClient) -> None:
-    github = FakeGitHubService()
-    service = ReviewService(github_service=github)  # type: ignore[arg-type]
+def test_rate_limited_agent_is_not_retried_as_text() -> None:
+    llm = FakeLLMClient(
+        fail_agents={"Security Engineer"}, fail_with=UpstreamRateLimitError("429", retry_after=5)
+    )
+    review = _service(llm)[0].review_pr_url(PR_URL)
+
+    security_calls = [c for c in llm.calls if c["agent"] == "Security Engineer"]
+    assert [c["mode"] for c in security_calls] == ["structured"]
+    assert review.metadata["complete"] is False
+
+
+def test_hallucinated_file_and_line_are_dropped() -> None:
+    llm = FakeLLMClient(
+        responses={
+            "Senior Software Engineer": '{"comments": ['
+            '{"file": "app/other.py", "line": 1, "severity": "HIGH", "category": "BUG", "message": "a"},'
+            '{"file": "app/example.py", "line": 999, "severity": "HIGH", "category": "BUG", "message": "b"},'
+            '{"file": "./app/example.py", "line": "3", "severity": "HIGH", "category": "BUG", "message": "c"}'
+            "]}",
+            "Security Engineer": '{"comments": []}',
+            "Senior Code Reviewer": '{"comments": []}',
+            "Software Architect": '{"comments": []}',
+        }
+    )
+    review = _service(llm)[0].review_pr_url(PR_URL)
+
+    assert [(c.file, c.line, c.message) for c in review.comments] == [("app/example.py", 3, "c")]
+    assert review.metadata["hallucinated_comments_dropped"] == 2
+
+
+def test_invalid_findings_are_rejected_individually() -> None:
+    llm = FakeLLMClient(
+        responses={
+            "Senior Software Engineer": '{"comments": ['
+            '{"line": 1, "severity": "URGENT", "category": "BUG", "message": "bad severity"},'
+            '{"line": 2, "severity": "HIGH", "category": "VIBES", "message": "bad category"},'
+            '{"line": 3, "severity": "HIGH", "category": "BUG", "message": "   "},'
+            '{"line": 4, "severity": "critical", "category": "code smell", "message": "aliases ok"}'
+            "]}",
+            "Security Engineer": '{"comments": []}',
+            "Senior Code Reviewer": '{"comments": []}',
+            "Software Architect": '{"comments": []}',
+        }
+    )
+    review = _service(llm)[0].review_pr_url(PR_URL)
+
+    assert [(c.severity, c.category, c.message) for c in review.comments] == [
+        ("HIGH", "STYLE", "aliases ok")
+    ]
+    assert review.metadata["invalid_findings_dropped"] == 3
+
+
+def test_publishing_is_opt_in() -> None:
+    service, github = _service(FakeLLMClient())
 
     service.review_pr_url(PR_URL, publish_to_github=False)
     assert github.published == []
@@ -125,65 +181,46 @@ def test_publishing_is_opt_in(fake_llm: FakeLLMClient) -> None:
     assert github.published[0]["commit_id"] == "deadbeef"
 
 
-def test_file_level_findings_are_published_in_the_review_body(fake_llm: FakeLLMClient) -> None:
-    """A finding with no line cannot be anchored inline, so it goes in the body."""
-    github = FakeGitHubService()
-    service = ReviewService(github_service=github)  # type: ignore[arg-type]
+def test_file_level_findings_are_published_in_the_review_body() -> None:
+    service, github = _service(FakeLLMClient())
 
     service.review_pr_url(PR_URL, publish_to_github=True)
 
     published = github.published[0]
-    assert published["comments"] == []
     assert "Service reaches into the data layer." in published["body"]
+    assert all(c["line"] in (12, 30) for c in published["comments"])
 
 
-def test_every_agent_receives_the_whole_diff(fake_llm: FakeLLMClient) -> None:
-    """Documents the Phase 2 bug: no per-file fan-out.
+def test_empty_pull_request_makes_no_llm_calls() -> None:
+    """psf/requests#7587 (0 files): short-circuit before any LLM call (plan 1.10)."""
+    llm = FakeLLMClient()
+    review = _service(llm, files=[])[0].review_pr_url(PR_URL)
 
-    Each agent is handed every file in one prompt. Rewrite this test when the
-    Send-based fan-out lands.
-    """
-    github = FakeGitHubService(
-        files=[
-            {
-                "filename": f"app/mod_{i}.py",
-                "status": "modified",
-                "patch": f"@@ -1 +1,2 @@\n+x = {i}\n",
-                "additions": 1,
-                "deletions": 0,
-                "changes": 1,
-            }
-            for i in range(3)
-        ]
-    )
-    service = ReviewService(github_service=github)  # type: ignore[arg-type]
-
-    service.review_pr_url(PR_URL)
-
-    reviewer_calls = [c for c in fake_llm.calls if c["agent"] != "Principal Software Engineer"]
-    assert len(reviewer_calls) == REVIEWER_AGENT_COUNT  # not 5 x 3 files
-
-    for call in reviewer_calls:
-        for i in range(3):
-            assert f"app/mod_{i}.py" in call["user_prompt"]
-
-
-def test_empty_pull_request_still_calls_every_agent(fake_llm: FakeLLMClient) -> None:
-    """Documents a missing guard, found against psf/requests#7587 (0 files).
-
-    A pull request with no reviewable files should short-circuit before any LLM
-    call. Today it does not: all six calls are made against a prompt whose
-    "Changed Files" section is empty, and the result still claims to be a
-    complete review. Rewrite this test when the guard lands (Phase 1.10).
-    """
-    service = ReviewService(github_service=FakeGitHubService(files=[]))  # type: ignore[arg-type]
-
-    review = service.review_pr_url(PR_URL)
-
-    assert len(fake_llm.calls) == REVIEWER_AGENT_COUNT + 1  # should be 0
+    assert llm.calls == []
+    assert review.comments == []
+    assert review.metadata["unreviewable"] is True
     assert review.metadata["total_files"] == 0
-    assert review.metadata["complete"] is True  # should be False, or not a review at all
 
-    # No file content reached the model, so any finding it returns is invented.
-    for call in fake_llm.calls:
-        assert "Diff:" not in call["user_prompt"]
+
+def test_pull_request_of_only_filtered_files_makes_no_llm_calls() -> None:
+    llm = FakeLLMClient()
+    files = [
+        _file("package-lock.json"),
+        _file("vendor/lib.go"),
+        _file("static/app.min.js"),
+        {"filename": "logo.png", "status": "added"},
+    ]
+    review = _service(llm, files=files)[0].review_pr_url(PR_URL)
+
+    assert llm.calls == []
+    assert review.metadata["unreviewable"] is True
+    assert {s["file"] for s in review.metadata["skipped_files"]} == {f["filename"] for f in files}
+
+
+def test_client_can_request_a_subset_of_agents() -> None:
+    llm = FakeLLMClient()
+    review = _service(llm)[0].review_pr_url(PR_URL, agents=["security"])
+
+    assert {c["agent"] for c in llm.calls} == {"Security Engineer", SUMMARY}
+    assert review.metadata["agents"] == ["security"]
+    assert {c.agent for c in review.comments} == {"security"}

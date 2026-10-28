@@ -1,10 +1,10 @@
 import time
-from functools import lru_cache
 from typing import Annotated, NoReturn
 
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 from app.api.schemas import (
+    AgentSchema,
     ChangedFileSchema,
     CreateReviewRequest,
     FindingSchema,
@@ -24,6 +24,7 @@ from app.api.schemas import (
 from app.errors import (
     AlreadyPublishedError,
     CodeReviewerError,
+    GitHubAuthError,
     GitHubRejectedError,
     InvalidPRURLError,
     LLMUnavailableError,
@@ -31,6 +32,8 @@ from app.errors import (
     PRNotFoundError,
     RepoAccessDeniedError,
     ReviewNotFoundError,
+    UnknownAgentError,
+    UpstreamError,
     UpstreamRateLimitError,
 )
 from app.models.enums import Severity
@@ -42,19 +45,18 @@ from app.settings import get_settings
 router = APIRouter(prefix="/api/v1", tags=["review"])
 
 
-@lru_cache(maxsize=1)
-def get_review_service() -> ReviewService:
-    """Build the review service on first use.
+def get_review_service(request: Request) -> ReviewService:
+    """The service built once by the application lifespan (plan 1.9).
 
-    Deferred rather than built at import time so the module stays importable
-    without credentials. Phase 4 moves this onto the application lifespan.
+    Tests replace it through ``app.dependency_overrides``.
     """
-    return ReviewService()
+    service: ReviewService = request.app.state.review_service
+    return service
 
 
-@lru_cache(maxsize=1)
-def get_review_store() -> ReviewStore:
-    return ReviewStore()
+def get_review_store(request: Request) -> ReviewStore:
+    store: ReviewStore = request.app.state.review_store
+    return store
 
 
 def get_pr_actions(
@@ -64,10 +66,15 @@ def get_pr_actions(
     return PullRequestActions(service.github_service, store)
 
 
-def _raise_http(exc: Exception, response: Response) -> NoReturn:
+def _raise_http(exc: Exception) -> NoReturn:
     """Map domain exceptions to HTTP errors without leaking upstream bodies."""
-    if isinstance(exc, InvalidPRURLError):
+    if isinstance(exc, InvalidPRURLError | UnknownAgentError):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    if isinstance(exc, GitHubAuthError):
+        # The server's own token is bad: not the caller's fault.
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY, detail="The server's GitHub credentials were rejected."
+        ) from exc
     if isinstance(exc, (PRNotFoundError, ReviewNotFoundError)):
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     if isinstance(exc, RepoAccessDeniedError):
@@ -79,15 +86,25 @@ def _raise_http(exc: Exception, response: Response) -> NoReturn:
     if isinstance(exc, (AlreadyPublishedError, GitHubRejectedError)):
         raise HTTPException(status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     if isinstance(exc, UpstreamRateLimitError):
-        if exc.retry_after is not None:
-            response.headers["Retry-After"] = str(int(exc.retry_after))
+        # Headers on the injected Response are dropped when an HTTPException is
+        # raised, so Retry-After must travel on the exception itself.
+        headers = (
+            {"Retry-After": str(max(1, round(exc.retry_after)))}
+            if exc.retry_after is not None
+            else None
+        )
         raise HTTPException(
             status.HTTP_429_TOO_MANY_REQUESTS,
             detail="Rate limit exceeded. Please try again later.",
+            headers=headers,
         ) from exc
     if isinstance(exc, LLMUnavailableError):
         raise HTTPException(
             status.HTTP_502_BAD_GATEWAY, detail="LLM service is currently unavailable."
+        ) from exc
+    if isinstance(exc, UpstreamError):
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY, detail="GitHub is currently unavailable."
         ) from exc
     if isinstance(exc, (CodeReviewerError, ValueError)):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
@@ -100,15 +117,15 @@ def _raise_http(exc: Exception, response: Response) -> NoReturn:
 def review_pull_request(
     payload: ReviewPRRequest,
     service: Annotated[ReviewService, Depends(get_review_service)],
-    response: Response,
 ) -> ReviewPRResponse:
     try:
         review_response = service.review_pr_url(
             pr_url=payload.pr_url,
             publish_to_github=payload.publish_to_github,
+            agents=payload.agents,
         )
     except Exception as exc:
-        _raise_http(exc, response)
+        _raise_http(exc)
 
     return ReviewPRResponse(
         summary=review_response.summary,
@@ -120,6 +137,7 @@ def review_pull_request(
                 category=c.category,
                 message=c.message,
                 suggestion=c.suggestion,
+                agent=c.agent,
             )
             for c in review_response.comments
         ],
@@ -165,6 +183,7 @@ def _detail(record: ReviewRecord) -> ReviewDetail:
                 message=c.message,
                 suggestion=c.suggestion,
                 suggested_code=c.suggested_code,
+                agent=c.agent,
                 dedup_collapsed_count=c.dedup_collapsed_count,
             )
             for i, c in enumerate(record.response.comments)
@@ -202,7 +221,6 @@ def create_review(
     payload: CreateReviewRequest,
     service: Annotated[ReviewService, Depends(get_review_service)],
     store: Annotated[ReviewStore, Depends(get_review_store)],
-    response: Response,
 ) -> ReviewDetail:
     """Run a review and keep it, so it can be published or merged later.
 
@@ -211,11 +229,30 @@ def create_review(
     started = time.perf_counter()
     try:
         request = service.fetch_request(payload.pr_url)
-        result = service.review(request)
+        result = service.review(request, agents=payload.agents)
     except Exception as exc:
-        _raise_http(exc, response)
+        _raise_http(exc)
     duration_ms = int((time.perf_counter() - started) * 1000)
     return _detail(store.add(payload.pr_url, request, result, duration_ms))
+
+
+@router.get("/agents", response_model=list[AgentSchema])
+def list_agents(
+    service: Annotated[ReviewService, Depends(get_review_service)],
+) -> list[AgentSchema]:
+    """The reviewer agents in the registry; pass a subset as ``agents`` on a review."""
+    return [
+        AgentSchema(
+            name=a.name,
+            category=a.category.value,
+            model_tier=a.model_tier,
+            enabled=a.enabled,
+            severity_floor=a.severity_floor.value,
+            max_findings_per_file=a.max_findings_per_file,
+            prompt_version=a.prompt_version,
+        )
+        for a in service.registry
+    ]
 
 
 @router.get("/reviews", response_model=list[ReviewListItem])
@@ -241,12 +278,11 @@ def list_reviews(store: Annotated[ReviewStore, Depends(get_review_store)]) -> li
 def get_review(
     review_id: str,
     store: Annotated[ReviewStore, Depends(get_review_store)],
-    response: Response,
 ) -> ReviewDetail:
     try:
         return _detail(store.get(review_id))
     except Exception as exc:
-        _raise_http(exc, response)
+        _raise_http(exc)
 
 
 @router.post("/reviews/{review_id}/publish", response_model=ReviewDetail)
@@ -254,13 +290,12 @@ def publish_review(
     review_id: str,
     payload: PublishRequest,
     actions: Annotated[PullRequestActions, Depends(get_pr_actions)],
-    response: Response,
 ) -> ReviewDetail:
     """Post findings to the PR as inline comments with GitHub suggested changes."""
     try:
         record = actions.publish(review_id, Severity(payload.min_severity), force=payload.force)
     except Exception as exc:
-        _raise_http(exc, response)
+        _raise_http(exc)
     return _detail(record)
 
 
@@ -268,12 +303,11 @@ def publish_review(
 def merge_readiness(
     review_id: str,
     actions: Annotated[PullRequestActions, Depends(get_pr_actions)],
-    response: Response,
 ) -> MergeReadinessSchema:
     try:
         readiness = actions.readiness(review_id)
     except Exception as exc:
-        _raise_http(exc, response)
+        _raise_http(exc)
     return MergeReadinessSchema(
         ready=readiness.ready,
         reviewed_sha=readiness.reviewed_sha,
@@ -288,11 +322,10 @@ def merge_pull_request(
     review_id: str,
     payload: MergeRequest,
     actions: Annotated[PullRequestActions, Depends(get_pr_actions)],
-    response: Response,
 ) -> ReviewDetail:
     """Merge the PR, if and only if every gate check passes on fresh GitHub data."""
     try:
         record = actions.merge(review_id, commit_title=payload.commit_title)
     except Exception as exc:
-        _raise_http(exc, response)
+        _raise_http(exc)
     return _detail(record)

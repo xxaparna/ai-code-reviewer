@@ -11,19 +11,27 @@ from fastapi import FastAPI
 
 from app.api.routes import router
 from app.logging_config import configure_logging
+from app.services.review_service import ReviewService
+from app.services.review_store import ReviewStore
 from app.settings import get_settings
 
 logger = structlog.get_logger(__name__)
 
 
 @asynccontextmanager
-async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-    """Validate configuration and configure logging before serving traffic."""
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Validate configuration, then build the long-lived services once (plan 1.9)."""
     settings = get_settings()
     configure_logging(level=settings.log_level, json_output=settings.log_json)
+    service = ReviewService.from_settings()
+    app.state.review_service = service
+    app.state.review_store = ReviewStore()
     logger.info("application.startup", model=settings.groq_model)
-    yield
-    logger.info("application.shutdown")
+    try:
+        yield
+    finally:
+        service.close()
+        logger.info("application.shutdown")
 
 
 def create_app() -> FastAPI:

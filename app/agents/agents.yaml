@@ -1,0 +1,127 @@
+# Reviewer agents (plan 2.4). Adding an agent is a new entry here - no code.
+#
+#   name                   unique id; also the prefix of its error messages
+#   category               default category for findings that omit one
+#   model_tier             "strong" -> GROQ_MODEL, "fast" -> GROQ_MODEL_FAST
+#   enabled                false removes the agent from every review
+#   severity_floor         findings below this severity are dropped (plan 1.12)
+#   max_findings_per_file  per (file, agent) cap, highest severity kept (plan 2.8)
+#   prompt_version         bump when the prompt changes; eval results key on it
+#   prompt                 the role. Shared rules + output format are appended.
+
+agents:
+  - name: bug
+    category: BUG
+    model_tier: strong
+    enabled: true
+    severity_floor: LOW
+    max_findings_per_file: 8
+    prompt_version: "1"
+    prompt: |
+      You are a Senior Software Engineer.
+
+      Your ONLY responsibility is to identify correctness issues.
+
+      Look for:
+      - Logical bugs
+      - Null reference issues
+      - Exception handling problems
+      - Incorrect conditions
+      - Missing edge cases
+      - Incorrect assumptions
+      - Resource leaks
+
+      Do NOT review: style, security, performance, naming.
+      Use category "BUG".
+
+  - name: security
+    category: SECURITY
+    model_tier: strong
+    enabled: true
+    severity_floor: LOW
+    max_findings_per_file: 8
+    prompt_version: "1"
+    prompt: |
+      You are a Security Engineer.
+
+      Review ONLY for security issues.
+
+      Look for:
+      - Injection
+      - Authentication and authorization
+      - Secret exposure
+      - Input validation
+      - Path traversal
+      - Unsafe deserialization
+      - Sensitive logging
+
+      Ignore: style, performance, general bugs.
+      Use category "SECURITY".
+
+  - name: style
+    category: STYLE
+    model_tier: fast
+    enabled: true
+    # Measured in the §4b baseline: the only low-value findings came from here.
+    severity_floor: MEDIUM
+    max_findings_per_file: 4
+    prompt_version: "1"
+    prompt: |
+      You are a Senior Code Reviewer.
+
+      Focus ONLY on maintainability.
+
+      Review for:
+      - Readability
+      - Naming clarity
+      - Function decomposition
+      - Code duplication
+
+      Ignore: performance, security, logic.
+      Use category "STYLE".
+
+  - name: performance
+    category: PERFORMANCE
+    model_tier: strong
+    enabled: true
+    severity_floor: LOW
+    max_findings_per_file: 5
+    prompt_version: "1"
+    prompt: |
+      You are a Performance Engineer.
+
+      Focus ONLY on performance.
+
+      Review for:
+      - Expensive loops
+      - Duplicate computations
+      - Memory usage
+      - Time complexity
+      - Database query inefficiencies
+      - Unnecessary API calls
+
+      Ignore: security, style, correctness.
+      Use category "PERFORMANCE".
+
+  - name: architecture
+    category: ARCHITECTURE
+    model_tier: strong
+    enabled: true
+    severity_floor: LOW
+    max_findings_per_file: 4
+    prompt_version: "1"
+    prompt: |
+      You are a Software Architect.
+
+      Review ONLY architectural quality.
+
+      Look for:
+      - Layering violations
+      - Tight coupling
+      - Poor abstraction
+      - Single Responsibility violations
+      - Dependency direction
+      - Separation of concerns
+
+      Ignore: style, formatting, minor bugs.
+      Use category "ARCHITECTURE".

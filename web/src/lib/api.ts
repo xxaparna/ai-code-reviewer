@@ -13,6 +13,7 @@ export interface Finding {
   message: string
   suggestion: string | null
   suggested_code: string | null
+  agent: string | null
   dedup_collapsed_count: number
 }
 
@@ -61,6 +62,12 @@ export interface ReviewMetadata {
   errors?: string[]
   complete?: boolean
   unreviewable?: boolean
+  partial?: boolean
+  partial_reason?: string | null
+  reviewed_files?: number
+  skipped_files?: { file: string; reason: string }[]
+  duplicates_collapsed?: number
+  agents?: string[]
 }
 
 export interface ReviewDetail {
