@@ -1,54 +1,62 @@
+"""The review graph: per-file, per-agent map-reduce (plan 2.1).
+
+    START --Send(file, agent) x N--> review --> merge --> summary --> END
+
+``fan_out`` runs at START and emits one ``Send`` per (reviewable file x
+selected agent), so the width is known only at runtime. All branches land in
+the same superstep, so ``merge`` runs exactly once, after every branch has
+written through the ``operator.add`` reducers. Concurrency is bounded by the
+``max_concurrency`` run config (see ``ReviewService``), not by the fan-out.
+"""
+
 from typing import Any
 
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
+from langgraph.types import Send
 
-from app.graph.nodes import (
-    architecture_node,
-    bug_node,
-    merge_node,
-    performance_node,
-    security_node,
-    style_node,
-    summary_node,
-)
-from app.graph.state import ReviewState
+from app.agents.registry import AgentRegistry, default_registry
+from app.graph.merge import make_merge_node
+from app.graph.reviewer import LLMFactory, ReviewerNode
+from app.graph.state import ReviewState, ReviewTask
+from app.graph.summary import make_summary_node
+from app.review_config import ReviewConfig
+from app.services.llm_client import LLMPool
+
+REVIEW_NODE = "review"
 
 
-def build_graph() -> CompiledStateGraph[ReviewState, None, Any, Any]:
-    """
-    Builds and compiles the multi-agent LangGraph workflow.
-    Executes review nodes in parallel from START, fanning in to merge -> summary -> END.
-    """
+def fan_out(state: ReviewState) -> list[Send]:
+    """One branch per (file, agent). Each branch sees exactly one file."""
+    return [
+        Send(REVIEW_NODE, ReviewTask(request=state["request"], file=file, agent=agent))
+        for file in state["files"]
+        for agent in state["agents"]
+    ]
+
+
+def build_graph(
+    *,
+    llm_for: LLMFactory | None = None,
+    registry: AgentRegistry | None = None,
+    config: ReviewConfig | None = None,
+) -> CompiledStateGraph[ReviewState, None, Any, Any]:
+    """Compile the graph. Building needs no credentials: model clients are lazy."""
+    registry = registry or default_registry()
+    config = config or ReviewConfig()
+    llm_for = llm_for or LLMPool()
+    reviewer = ReviewerNode(registry, llm_for, config)
+
+    def review(state: ReviewTask) -> dict[str, Any]:
+        return reviewer(state)
+
     builder = StateGraph(ReviewState)
+    builder.add_node(REVIEW_NODE, review, input_schema=ReviewTask)
+    builder.add_node("merge", make_merge_node(config))
+    builder.add_node("summary", make_summary_node(llm_for))
 
-    # Add Reviewer Nodes
-    builder.add_node("bug", bug_node)
-    builder.add_node("security", security_node)
-    builder.add_node("style", style_node)
-    builder.add_node("performance", performance_node)
-    builder.add_node("architecture", architecture_node)
-
-    # Add Merging & Summary Nodes
-    builder.add_node("merge", merge_node)
-    builder.add_node("summary", summary_node)
-
-    # Parallel Fan-Out from START to reviewer nodes
-    builder.add_edge(START, "bug")
-    builder.add_edge(START, "security")
-    builder.add_edge(START, "style")
-    builder.add_edge(START, "performance")
-    builder.add_edge(START, "architecture")
-
-    # Fan-In from reviewer nodes to merge
-    builder.add_edge("bug", "merge")
-    builder.add_edge("security", "merge")
-    builder.add_edge("style", "merge")
-    builder.add_edge("performance", "merge")
-    builder.add_edge("architecture", "merge")
-
-    # Final Summary and Execution Termination
+    builder.add_conditional_edges(START, fan_out, [REVIEW_NODE])
+    builder.add_edge(REVIEW_NODE, "merge")
     builder.add_edge("merge", "summary")
     builder.add_edge("summary", END)
-
     return builder.compile()

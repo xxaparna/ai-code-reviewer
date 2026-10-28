@@ -1,4 +1,5 @@
 import pytest
+from app.errors import InvalidPRURLError
 from app.utils.github_parser import parse_pr_url
 
 
@@ -34,3 +35,25 @@ def test_parse_pr_url_with_tab_suffix() -> None:
 def test_parse_pr_url_non_numeric_number() -> None:
     with pytest.raises(ValueError):
         parse_pr_url("https://github.com/owner/repo/pull/abc")
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://evil.com/a/b/pull/1",
+        "http://github.com/a/b/pull/1",
+        "https://github.com.evil.com/a/b/pull/1",
+        "https://user@github.com/a/b/pull/1",
+        "https://github.com:8443/a/b/pull/1",
+        "https://github.com/../b/pull/1",
+        "https://github.com/a/../pull/1",
+        "https://github.com/a/b%2F..%2Fc/pull/1",
+        "https://github.com/a/b/pull/0",
+        "https://github.com/a/b/pull/\u0661",
+        "https://github.com/a/b/pull/1/files/extra/more",
+        "",
+    ],
+)
+def test_hostile_or_malformed_urls_are_rejected(url: str) -> None:
+    with pytest.raises(InvalidPRURLError):
+        parse_pr_url(url)

@@ -19,6 +19,9 @@ dependencies = [
     "pydantic-settings==2.13.1",
     "structlog==25.5.0",
     "tenacity==9.1.4",
+    "rapidfuzz==3.14.6",
+    "pyyaml==6.0.3",
+    "groq==0.37.1",  # imported directly: retries classify Groq's exception types
 ]
 
 [project.optional-dependencies]
@@ -29,6 +32,7 @@ dev = [
     "mypy==1.19.0",
     "pre-commit==4.4.0",
     "respx==0.22.0",
+    "types-PyYAML==6.0.12.20260906",
 ]
 
 [project.scripts]
@@ -85,13 +89,6 @@ strict = true
 warn_unreachable = true
 pretty = true
 files = ["app", "tests", "eval"]
-
-# The LangGraph node layer still passes state around as a plain dict; it is
-# rewritten in Phase 2 (typed state + reducers), at which point these
-# relaxations should be deleted rather than extended.
-[[tool.mypy.overrides]]
-module = ["app.graph.*"]
-disallow_any_explicit = false
 
 [[tool.mypy.overrides]]
 module = ["langchain_groq.*", "langgraph.*"]

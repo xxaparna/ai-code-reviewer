@@ -128,7 +128,7 @@ def main() -> int:
     )
 
     print(f"Reviewing a synthetic file with {len(PLANTED)} planted defects...\n")
-    review = ReviewService().review(request)
+    review = ReviewService.from_settings().review(request)
 
     findings = [f"{c.category} {c.message} {c.suggestion or ''}" for c in review.comments]
     unclaimed = list(findings)

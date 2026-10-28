@@ -22,6 +22,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("pr_url", help="GitHub pull request URL")
     parser.add_argument(
+        "--agents",
+        help="Comma-separated subset of agents to run (default: all enabled)",
+    )
+    parser.add_argument(
         "--publish",
         action="store_true",
         help="Publish the review back to the pull request on GitHub",
@@ -41,6 +45,14 @@ def _print_report(review: ReviewResponse) -> None:
         if comment.suggestion:
             print(f"  Suggestion: {comment.suggestion}")
         print("-" * 80)
+
+    skipped = review.metadata.get("skipped_files", [])
+    if skipped:
+        print(f"\nSkipped {len(skipped)} file(s):")
+        for item in skipped:
+            print(f"  - {item['file']}: {item['reason']}")
+    if review.metadata.get("partial_reason"):
+        print(f"\nPARTIAL REVIEW: {review.metadata['partial_reason']}")
 
     print(f"\nMetadata: {review.metadata}")
 
@@ -70,8 +82,11 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"Starting AI code review for: {args.pr_url}")
 
+    agents = [a.strip() for a in args.agents.split(",") if a.strip()] if args.agents else None
     try:
-        review = ReviewService().review_pr_url(args.pr_url, publish_to_github=args.publish)
+        review = ReviewService.from_settings().review_pr_url(
+            args.pr_url, publish_to_github=args.publish, agents=agents
+        )
     except Exception as exc:  # noqa: BLE001 - CLI boundary: report and exit non-zero
         print(f"Error executing review: {exc}", file=sys.stderr)
         return EXIT_ERROR
@@ -82,7 +97,8 @@ def main(argv: list[str] | None = None) -> int:
 
     _print_report(review)
 
-    return EXIT_INCOMPLETE if errors else EXIT_OK
+    complete = bool(review.metadata.get("complete", not errors))
+    return EXIT_OK if complete else EXIT_INCOMPLETE
 
 
 if __name__ == "__main__":

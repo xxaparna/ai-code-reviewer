@@ -4,42 +4,72 @@ Phase 4 converts this to ``httpx.AsyncClient``; the interface is kept narrow so
 that change stays local.
 """
 
+import time
+from collections.abc import Callable
 from types import TracebackType
 from typing import Any, Self
 from urllib.parse import quote
 
 import httpx
 import structlog
-from tenacity import (
-    retry,
-    retry_if_exception,
-    stop_after_attempt,
-    wait_exponential_jitter,
-)
+from tenacity import Retrying, retry_if_exception, stop_after_attempt
 
 from app.errors import (
     CodeReviewerError,
+    GitHubAuthError,
     GitHubRejectedError,
     PRNotFoundError,
     RepoAccessDeniedError,
+    UpstreamError,
     UpstreamRateLimitError,
 )
 from app.settings import get_settings
+from app.utils.retry import MAX_RETRY_AFTER_SECONDS, WaitRetryAfter, parse_retry_after
 
 logger = structlog.get_logger(__name__)
 
 DEFAULT_TIMEOUT = httpx.Timeout(connect=10.0, read=30.0, write=30.0, pool=10.0)
 MAX_PER_PAGE = 100
+MAX_ATTEMPTS = 3
+IDEMPOTENT_METHODS = frozenset({"GET", "HEAD", "PUT", "DELETE", "OPTIONS"})
 
 
-def _should_retry_exception(exc: BaseException) -> bool:
-    """Retry on network errors, timeouts, 429s, or 5xx server errors."""
-    if isinstance(exc, (httpx.TransportError, httpx.TimeoutException)):
+def _is_rate_limited(response: httpx.Response) -> bool:
+    """429, or a 403 that GitHub uses for primary/secondary rate limits."""
+    if response.status_code == 429:
         return True
+    if response.status_code != 403:
+        return False
+    headers = response.headers
+    return headers.get("x-ratelimit-remaining") == "0" or "retry-after" in headers
+
+
+def _retry_after_of(exc: BaseException) -> float | None:
     if isinstance(exc, httpx.HTTPStatusError):
-        status = exc.response.status_code
-        return status == 429 or status >= 500
-    return False
+        return parse_retry_after(exc.response.headers)
+    return None
+
+
+def _make_retry_predicate(method: str) -> Callable[[BaseException], bool]:
+    """Classify *raw* ``httpx`` errors; domain mapping happens after the last attempt.
+
+    POST is not idempotent (a 502 may still have created the review), so it is
+    retried only when GitHub certainly did not act: rate limits and failed connects.
+    """
+    idempotent = method.upper() in IDEMPOTENT_METHODS
+
+    def should_retry(exc: BaseException) -> bool:
+        if isinstance(exc, httpx.HTTPStatusError):
+            response = exc.response
+            if _is_rate_limited(response):
+                hinted = parse_retry_after(response.headers)
+                return hinted is None or hinted <= MAX_RETRY_AFTER_SECONDS
+            return idempotent and response.status_code >= 500
+        if isinstance(exc, httpx.ConnectError | httpx.ConnectTimeout):
+            return True
+        return idempotent and isinstance(exc, httpx.TransportError)
+
+    return should_retry
 
 
 def _github_message(response: httpx.Response) -> str:
@@ -51,19 +81,61 @@ def _github_message(response: httpx.Response) -> str:
     return str(message)[:200] if message else f"HTTP {response.status_code}"
 
 
+def _map_status_error(exc: httpx.HTTPStatusError, endpoint: str) -> CodeReviewerError:
+    """Translate a final GitHub error response into a domain exception (no upstream body)."""
+    response = exc.response
+    status = response.status_code
+    if _is_rate_limited(response):
+        return UpstreamRateLimitError(
+            "GitHub API rate limit exceeded", retry_after=parse_retry_after(response.headers)
+        )
+    if status == 404:
+        # GitHub answers 404, not 403, for private repos the token can't see.
+        return PRNotFoundError(
+            f"GitHub returned 404 for {endpoint}. Check the URL, or, if the repository "
+            "is private, that GITHUB_TOKEN belongs to an account with access to it."
+        )
+    if status == 401:
+        return GitHubAuthError(
+            "GitHub rejected the server's credentials (401). Check GITHUB_TOKEN."
+        )
+    if status == 403:
+        return RepoAccessDeniedError(f"Access denied (403) for {endpoint}")
+    if status in (405, 409, 422):
+        # Safe to surface: GitHub's message here is a short reason such as
+        # "Head branch was modified" or "Pull Request is not mergeable".
+        return GitHubRejectedError(
+            f"GitHub rejected the request: {_github_message(response)}", status
+        )
+    if status >= 500:
+        return UpstreamError(f"GitHub is unavailable ({status}) for {endpoint}")
+    return CodeReviewerError(f"GitHub API error ({status}) at {endpoint}")
+
+
 class GitHubService:
     BASE_URL = "https://api.github.com"
 
-    def __init__(self, token: str | None = None, client: httpx.Client | None = None) -> None:
-        auth_token = token or get_settings().github_token.get_secret_value()
+    def __init__(
+        self,
+        token: str | None = None,
+        client: httpx.Client | None = None,
+        *,
+        max_attempts: int = MAX_ATTEMPTS,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        self._max_attempts = max_attempts
+        self._sleep = sleep
+        if client is not None:
+            self._client = client
+            return
 
+        auth_token = token or get_settings().github_token.get_secret_value()
         headers = {
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
             "Authorization": f"Bearer {auth_token}",
         }
-
-        self._client = client or httpx.Client(
+        self._client = httpx.Client(
             base_url=self.BASE_URL,
             headers=headers,
             timeout=DEFAULT_TIMEOUT,
@@ -84,12 +156,17 @@ class GitHubService:
     def close(self) -> None:
         self._client.close()
 
-    @retry(
-        retry=retry_if_exception(_should_retry_exception),
-        stop=stop_after_attempt(3),
-        wait=wait_exponential_jitter(initial=1, max=10),
-        reraise=True,
-    )
+    def _send(
+        self,
+        method: str,
+        endpoint: str,
+        params: dict[str, Any] | None,
+        json_data: dict[str, Any] | None,
+    ) -> httpx.Response:
+        response = self._client.request(method, endpoint, params=params, json=json_data)
+        response.raise_for_status()
+        return response
+
     def _request(
         self,
         method: str,
@@ -97,39 +174,32 @@ class GitHubService:
         params: dict[str, Any] | None = None,
         json_data: dict[str, Any] | None = None,
     ) -> Any:
+        """Send a request; retry transient failures, then map errors to domain exceptions.
+
+        Retrying happens on raw ``httpx`` errors and the mapping happens outside the
+        retry loop - mapping inside it would hide the error from the retry predicate.
+        """
+        retrying = Retrying(
+            retry=retry_if_exception(_make_retry_predicate(method)),
+            stop=stop_after_attempt(self._max_attempts),
+            wait=WaitRetryAfter(_retry_after_of),
+            sleep=self._sleep,
+            before_sleep=lambda rs: logger.warning(
+                "github.request_retry",
+                endpoint=endpoint,
+                attempt=rs.attempt_number,
+                error=type(rs.outcome.exception()).__name__ if rs.outcome else None,
+            ),
+            reraise=True,
+        )
         try:
-            response = self._client.request(method, endpoint, params=params, json=json_data)
-            response.raise_for_status()
-            return response.json()
+            response = retrying(self._send, method, endpoint, params, json_data)
         except httpx.HTTPStatusError as exc:
-            status = exc.response.status_code
-            if status == 404:
-                # GitHub answers 404, not 403, for private repos the token can't see.
-                raise PRNotFoundError(
-                    f"GitHub returned 404 for {endpoint}. Check the URL, or, if the repository "
-                    "is private, that GITHUB_TOKEN belongs to an account with access to it."
-                ) from exc
-            if status in (401, 403):
-                raise RepoAccessDeniedError(f"Access denied ({status}) for {endpoint}") from exc
-            if status == 429:
-                retry_after_hdr = exc.response.headers.get("Retry-After")
-                retry_after = (
-                    float(retry_after_hdr)
-                    if retry_after_hdr and retry_after_hdr.isdigit()
-                    else None
-                )
-                raise UpstreamRateLimitError(
-                    "GitHub API rate limit exceeded", retry_after=retry_after
-                ) from exc
-            if status in (405, 409, 422):
-                # Safe to surface: GitHub's message here is a short reason such as
-                # "Head branch was modified" or "Pull Request is not mergeable".
-                reason = _github_message(exc.response)
-                raise GitHubRejectedError(f"GitHub rejected the request: {reason}", status) from exc
-            raise CodeReviewerError(f"GitHub API error ({status}) at {endpoint}") from exc
-        except (httpx.TransportError, httpx.TimeoutException) as exc:
+            raise _map_status_error(exc, endpoint) from exc
+        except httpx.TransportError as exc:
             logger.warning("github.request_network_error", endpoint=endpoint, error=str(exc))
-            raise
+            raise UpstreamError(f"GitHub is unreachable ({type(exc).__name__})") from exc
+        return response.json()
 
     def get_pull_request(self, owner: str, repo: str, pull_number: int) -> dict[str, Any]:
         safe_owner = quote(owner, safe="")

@@ -64,9 +64,14 @@ def _check_open(pr: dict[str, Any]) -> GateCheck:
 
 
 def _check_complete(record: ReviewRecord) -> GateCheck:
-    errors: list[str] = record.response.metadata.get("errors", [])
-    if record.response.metadata.get("complete", False):
+    metadata = record.response.metadata
+    errors: list[str] = metadata.get("errors", [])
+    if metadata.get("complete", False):
         return GateCheck("review_complete", "Review completed", True, "Every agent finished")
+    if not errors and metadata.get("partial_reason"):
+        return GateCheck(
+            "review_complete", "Review completed", False, str(metadata["partial_reason"])
+        )
     return GateCheck(
         "review_complete",
         "Review completed",

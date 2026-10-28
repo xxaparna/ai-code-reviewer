@@ -33,17 +33,16 @@ def make_review_request(**overrides: Any) -> ReviewRequest:
 
 def make_review_state(**overrides: Any) -> ReviewState:
     """Build a complete ReviewState so nodes can be called in isolation."""
+    request = make_review_request()
     state: ReviewState = {
-        "request": make_review_request(),
-        "current_file": None,
-        "bug_comments": [],
-        "security_comments": [],
-        "style_comments": [],
-        "performance_comments": [],
-        "architecture_comments": [],
+        "request": request,
+        "files": list(request.files),
+        "agents": [],
+        "findings": [],
+        "agent_runs": [],
+        "errors": [],
         "merged_comments": [],
         "summary": "",
-        "errors": [],
         "metadata": {},
     }
     state.update(overrides)  # type: ignore[typeddict-item]  # test-only partial override

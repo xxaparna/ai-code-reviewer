@@ -130,15 +130,3 @@ def filter_hallucinations(
         valid_comments.append(comment)
 
     return valid_comments
-
-
-def is_pr_reviewable(files: list[ReviewFile]) -> bool:
-    """Return True if PR has at least one file with reviewable patch content."""
-    if not files:
-        return False
-
-    for f in files:
-        if f.patch and f.patch.strip():
-            return True
-
-    return False

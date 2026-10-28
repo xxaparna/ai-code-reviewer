@@ -11,6 +11,11 @@ class ReviewPRRequest(BaseModel):
     publish_to_github: bool = Field(
         False, description="Whether to publish inline comments and review to GitHub"
     )
+    agents: list[str] | None = Field(
+        None,
+        min_length=1,
+        description="Run only these agents (see GET /api/v1/agents). Default: all enabled.",
+    )
 
 
 class ReviewCommentSchema(BaseModel):
@@ -20,6 +25,7 @@ class ReviewCommentSchema(BaseModel):
     category: str
     message: str
     suggestion: str | None = None
+    agent: str | None = None
 
 
 class ReviewPRResponse(BaseModel):
@@ -37,6 +43,21 @@ class CreateReviewRequest(BaseModel):
     pr_url: str = Field(
         ..., description="GitHub Pull Request URL (e.g., https://github.com/owner/repo/pull/1)"
     )
+    agents: list[str] | None = Field(
+        None,
+        min_length=1,
+        description="Run only these agents (see GET /api/v1/agents). Default: all enabled.",
+    )
+
+
+class AgentSchema(BaseModel):
+    name: str
+    category: str
+    model_tier: str
+    enabled: bool
+    severity_floor: SeverityLiteral
+    max_findings_per_file: int
+    prompt_version: str
 
 
 class FindingSchema(BaseModel):
@@ -51,6 +72,7 @@ class FindingSchema(BaseModel):
     suggested_code: str | None = Field(
         None, description="Exact replacement for lines start_line..line; posted as a suggestion."
     )
+    agent: str | None = Field(None, description="Reviewer agent that reported it.")
     dedup_collapsed_count: int = 1
 
 
